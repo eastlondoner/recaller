@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM", "WebWorker"],
+    "types": ["bun-types", "@cloudflare/workers-types"],
+    "baseUrl": "./src"
+  },
+  "include": [
+    "src/worker.ts",
+    "src/perfect-read.ts",
+    "src/sidecar-reader.ts",
+    "src/mp4-parser.ts",
+    "src/container.ts",
+    "alchemy.run.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "src/perfect_read.ts",
+    "src/mp4_parser.ts",
+    "src/sqlite_parser.ts",
+    "src/implementations/**",
+    "src/types/**"
+  ]
+}

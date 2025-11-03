@@ -1,0 +1,18 @@
+{
+  "name": "cloudflare_infra",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "@types/bun": "latest",
+    "@cloudflare/containers": "latest",
+    "alchemy": "latest",
+    "typescript": "latest",
+    "wa-sqlite": "^0.9.12"
+  },
+  "scripts": {
+  "deploy": "bun alchemy deploy --env-file .env",
+  "dev": "bun alchemy dev --env-file .env"
+  }
+}

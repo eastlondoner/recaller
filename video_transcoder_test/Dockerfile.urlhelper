@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+RUN pip install --no-cache-dir boto3
+COPY generate_url.py /generate_url.py
+ENTRYPOINT ["python", "/generate_url.py"]
+
+

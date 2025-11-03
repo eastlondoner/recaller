@@ -1,0 +1,45 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio-test
+    ports:
+      - "9000:9000"  # API port
+      - "9001:9001"  # Console port
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - test-network
+
+  transcoder:
+    build:
+      context: ../video_transcoder
+      dockerfile: Dockerfile
+    container_name: transcoder-test
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Allow container to access host services
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      PORT: 8080
+    networks:
+      - test-network
+
+volumes:
+  minio_data:
+
+networks:
+  test-network:
+    driver: bridge
+
