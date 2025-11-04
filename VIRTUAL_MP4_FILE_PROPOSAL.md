@@ -206,5 +206,3 @@ Worker assembles virtual stream `A|B|C` on demand.
 ### Summary
 
 By generating a small sidx sidecar and splicing it ahead of the original object at the edge, we let standard demuxers perform tiny prefix reads plus the first fragment to get the first frame. This preserves our single‑pass transcode pipeline and avoids a heavy rewrite step while drastically cutting bandwidth for first‑frame access.
-
-

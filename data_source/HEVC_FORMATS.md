@@ -243,5 +243,3 @@ Both formats validated:
 **Created:** November 2, 2025  
 **Test files:** 10 second sample from Bluey video  
 **Source:** `test_short_h264.mp4` (H.264 baseline)
-
-

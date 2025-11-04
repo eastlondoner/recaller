@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     git \
     wget \
+    curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -39,17 +40,19 @@ RUN (git clone --depth 1 --branch "v${PYTHON_VERSION}" https://github.com/python
     ./configure \
         --disable-gil \
         --enable-optimizations \
-        --with-lto \
         --prefix=/usr/local \
         --enable-shared \
         --without-ensurepip && \
-    make -j$(nproc) && \
+    # Limit parallel jobs to avoid GCC LTO bugs with high parallelism
+    make -j$(($(nproc) / 2)) && \
     make altinstall && \
+    # Register shared libraries with ldconfig
+    ldconfig && \
     # Create symlinks for python3.14 -> python3 and python3.14 -> python
     ln -sf /usr/local/bin/python3.14 /usr/local/bin/python3 && \
     ln -sf /usr/local/bin/python3.14 /usr/local/bin/python && \
-    # Install pip
-    curl -sS https://bootstrap.pypa.io/get-pip.py | /usr/local/bin/python3.14 && \
+    # Install pip (ensure curl is available and LD_LIBRARY_PATH is set)
+    LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH curl -sS https://bootstrap.pypa.io/get-pip.py | LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH /usr/local/bin/python3.14 && \
     # Clean up
     cd / && rm -rf /tmp/cpython
 

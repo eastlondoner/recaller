@@ -195,5 +195,3 @@ If the build fails:
 - [PyNvVideoCodec Documentation](https://developer.nvidia.com/nvidia-video-codec-sdk)
 - [CUDA Driver API Reference](https://docs.nvidia.com/cuda/cuda-driver-api/index.html)
 - [cuCtxCreate_v4 Documentation](https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html#group__CUDA__CTX_1g65dc0012348bc84810e2103a40d8e2cf)
-
-

@@ -84,3 +84,5 @@ data_source/*.mp4
 *.tmp
 *.temp
 .cache/
+# SpecStory explanation file
+.specstory/.what-is-this.md

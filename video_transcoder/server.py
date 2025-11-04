@@ -71,6 +71,30 @@ class StreamingTranscoder:
         self.crf = "28"  # Good quality/size ratio for HEVC
         self.preset = "slower"  # Most compression to optimize for storage
         self.threads = "0"  # Auto - use all available cores/GPU
+        
+        # Track active processes for cleanup on client disconnect
+        self._ytdlp_process = None
+        self._ffmpeg_process = None
+        self._process_lock = threading.Lock()
+    
+    def kill_processes(self):
+        """Kill all active processes with SIGKILL (called when client disconnects)."""
+        with self._process_lock:
+            killed_any = False
+            for proc, name in [
+                (self._ffmpeg_process, "ffmpeg"),
+                (self._ytdlp_process, "yt-dlp"),
+            ]:
+                if proc and proc.poll() is None:  # Process is still running
+                    try:
+                        self.logger.warning(f"{self.log_prefix} Killing {name} (SIGKILL) due to client disconnect")
+                        proc.kill()  # SIGKILL
+                        killed_any = True
+                    except Exception as e:
+                        self.logger.error(f"{self.log_prefix} Failed to kill {name}: {e}")
+            
+            if killed_any:
+                self.logger.info(f"{self.log_prefix} All active processes killed due to client disconnect")
     
     def process_streaming(self, progress_callback=None):
         """
@@ -148,6 +172,8 @@ class StreamingTranscoder:
                     stderr=subprocess.PIPE,
                     bufsize=0,
                 )
+                with self._process_lock:
+                    self._ytdlp_process = ytdlp_process
                 self.logger.info(f"{self.log_prefix} yt-dlp started pid={ytdlp_process.pid}")
                 input_stdin = ytdlp_process.stdout
                 input_source = "pipe:0"
@@ -213,6 +239,8 @@ class StreamingTranscoder:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+            with self._process_lock:
+                self._ffmpeg_process = ffmpeg_process
             self.logger.info(f"{self.log_prefix} ffmpeg started pid={ffmpeg_process.pid}")
             
             # Close ytdlp's stdout in ffmpeg so it gets a SIGPIPE if ffmpeg exits
@@ -685,6 +713,9 @@ async def transcode_video(request_data: TranscodeRequest, request: Request):
         except Exception as e:
             logger.debug(f"[req {request_id}] Failed to queue progress update: {e}")
     
+    # Shared transcoder reference for kill_processes access
+    transcoder_ref = {"instance": None}
+    
     async def run_transcoding():
         """Run transcoding in thread pool and collect result"""
         try:
@@ -697,6 +728,7 @@ async def transcode_video(request_data: TranscodeRequest, request: Request):
                 object_key=request_data.object_key,
                 request_id=request_id
             )
+            transcoder_ref["instance"] = transcoder  # Make transcoder accessible
             success, error = await asyncio.get_event_loop().run_in_executor(
                 executor,
                 transcoder.process_streaming,
@@ -721,12 +753,15 @@ async def transcode_video(request_data: TranscodeRequest, request: Request):
             while not transcoding_complete.is_set():
                 # Check if client disconnected
                 if await request.is_disconnected():
-                    logger.info(f"[req {request_id}] Client disconnected")
+                    logger.info(f"[req {request_id}] Client disconnected - killing all processes")
+                    # Kill all processes immediately with SIGKILL
+                    if transcoder_ref["instance"]:
+                        transcoder_ref["instance"].kill_processes()
                     break
                 
                 # Try to get progress update with timeout
                 try:
-                    event_data = await asyncio.wait_for(progress_queue.get(), timeout=0.5)
+                    event_data = await asyncio.wait_for(progress_queue.get(), timeout=5)
                     yield f"data: {json.dumps(event_data)}\n\n"
                 except asyncio.TimeoutError:
                     # No progress update, but continue loop to check completion/disconnection

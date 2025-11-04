@@ -25,5 +25,3 @@ url = s3.generate_presigned_url(
     ExpiresIn=3600
 )
 print(url)
-
-

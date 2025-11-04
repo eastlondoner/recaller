@@ -2,6 +2,10 @@
 
 A Docker container that provides an HTTP service to download videos (YouTube or direct MP4 URLs), transcode them to HEVC format, and upload to S3 presigned URLs. Creates both fragmented (for streaming) and faststart (for seeking) variants.
 
+## Deployment
+
+This is deployed as a Cloudflare Container defined in `cloudflare_infra/alchemy.run.ts`.
+
 ## Features
 
 - **Streaming Pipeline**: Downloads from YouTube → transcodes with ffmpeg → uploads to S3

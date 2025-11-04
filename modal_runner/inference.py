@@ -102,6 +102,8 @@ image = (
         "cuda-python",
         "requests==2.31.0",
         "wandb",
+        "plotly",
+        "pandas",
     )
     # Patch PyNvVideoCodec Python wrapper to allow zero-frame streams (fragmented MP4 with minimal moov)
     # This avoids triggering a full-stream scan and prevents raising on num_frames==0
@@ -161,10 +163,12 @@ def run_inference_hevc_fragmented_with_proxy():
         print(f"VIDEO {idx}: {url}")
     
     # Use seeded random to select frames from first 10 seconds (reproducible)
+    # Process 3 batches, each with different random timestamps
     result = run_inference_impl(
         video_urls=video_urls,
         random_seed=42,
         offset_max_seconds=10.0,
+        num_batches=10,
         return_frame_png=True,
     )
     
@@ -312,21 +316,38 @@ def main():
             print(f"cuDNN Version: {result.get('cudnn_version', 'N/A')}")
         print(f"PyTorch Version: {result.get('torch_version', 'N/A')}")
         print(f"Device: {result.get('device', 'N/A')}")
-        batch_size = result.get('num_videos', 1)
-        print(f"Batch size: {batch_size}")
-        top_classes = result.get('top_classes')
-        confidences = result.get('confidences')
-        timestamps = result.get('selected_timestamps_seconds') or []
-        if top_classes and confidences:
-            print("Predictions:")
-            for idx, (cls, conf) in enumerate(zip(top_classes, confidences)):
-                ts = timestamps[idx] if idx < len(timestamps) else None
-                ts_str = f", timestamp={ts:.3f}s" if ts is not None else ""
-                print(f"  Sample {idx}: class={cls}, confidence={conf:.4f}{ts_str}")
+        
+        num_batches = result.get('num_batches', 1)
+        batch_size = result.get('num_videos_per_batch', result.get('num_videos', 1))
+        print(f"Num batches: {num_batches}")
+        print(f"Videos per batch: {batch_size}")
+        
+        # Show all batch predictions
+        batches = result.get('batches', [])
+        if batches:
+            print("Predictions by batch:")
+            for batch in batches:
+                batch_idx = batch.get('batch_index', 0)
+                print(f"  Batch {batch_idx}:")
+                for idx, (cls, conf, ts) in enumerate(zip(batch['top_classes'], batch['confidences'], batch['timestamps'])):
+                    print(f"    Video {idx}: class={cls}, confidence={conf:.4f}, timestamp={ts:.3f}s")
         else:
-            print(f"Top class: {result.get('top_class', 'N/A')}")
-            print(f"Confidence: {result.get('confidence', 0):.4f}")
+            # Fallback to legacy format
+            top_classes = result.get('top_classes')
+            confidences = result.get('confidences')
+            timestamps = result.get('selected_timestamps_seconds') or []
+            if top_classes and confidences:
+                print("Predictions:")
+                for idx, (cls, conf) in enumerate(zip(top_classes, confidences)):
+                    ts = timestamps[idx] if idx < len(timestamps) else None
+                    ts_str = f", timestamp={ts:.3f}s" if ts is not None else ""
+                    print(f"  Sample {idx}: class={cls}, confidence={conf:.4f}{ts_str}")
+            else:
+                print(f"Top class: {result.get('top_class', 'N/A')}")
+                print(f"Confidence: {result.get('confidence', 0):.4f}")
+        
         print(f"Frame extraction time: {result.get('frame_extraction_time_seconds', 0):.2f}s")
+        print(f"Inference time: {result.get('inference_time_seconds', 0):.2f}s")
         print(f"{'='*80}\n")
     
     # Test: Perfect Reads with fragmented video
@@ -337,19 +358,27 @@ def main():
         # Save decoded frames locally if returned
         try:
             from pathlib import Path
-            frames = result1.get('frame_png_bytes_list')
-            if frames:
+            all_frames = result1.get('all_frame_png_bytes')
+            if all_frames:
                 output_dir = Path(__file__).parent / "decoded_frames"
                 output_dir.mkdir(parents=True, exist_ok=True)
                 saved_paths = []
-                for idx, frame_bytes in enumerate(frames):
-                    out_path = output_dir / f"fragmented_frame_{idx}.png"
-                    with open(out_path, 'wb') as f:
-                        f.write(frame_bytes)
-                    saved_paths.append(str(out_path))
-                print(f"Saved decoded frames to: {', '.join(saved_paths)}")
+                for batch_idx, batch_frames in enumerate(all_frames):
+                    for video_idx, frame_bytes in enumerate(batch_frames):
+                        out_path = output_dir / f"batch{batch_idx}_video{video_idx}.png"
+                        with open(out_path, 'wb') as f:
+                            f.write(frame_bytes)
+                        saved_paths.append(str(out_path))
+                print(f"Saved {len(saved_paths)} decoded frames to: {output_dir}")
+                print(f"Files: {', '.join([p.split('/')[-1] for p in saved_paths])}")
             else:
                 print("No frame PNG data returned in result.")
+            
+            # Check for timing waterfall chart
+            waterfall_path = Path(__file__).parent / "timing_waterfall.html"
+            if waterfall_path.exists():
+                print(f"\n📊 Timing waterfall chart saved to: {waterfall_path}")
+                print("   Open this file in a browser to see the interactive timing breakdown!")
         except Exception as e:
             print(f"Failed to save decoded frames locally: {e}")
     except Exception as e:
