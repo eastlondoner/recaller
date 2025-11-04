@@ -20,7 +20,7 @@ import multiprocessing
 import urllib.parse
 import requests
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from typing import Dict, Any, Optional, Tuple, Sequence, List, TypedDict
 from pathlib import Path
 from contextlib import contextmanager
@@ -74,6 +74,69 @@ def get_timing_events() -> List[Dict[str, Any]]:
         return list(_timing_events)
 
 
+def download_perfect_reads_segment(
+    url: str,
+    dest_dir: Path,
+    batch_idx: int,
+    video_idx: int
+) -> str:
+    """Download a Perfect Reads segment to local disk.
+    
+    Args:
+        url: Perfect Reads URL to download
+        dest_dir: Destination directory (e.g., /tmp/recaller/segments/batch0)
+        batch_idx: Batch index for naming
+        video_idx: Video index for naming
+        
+    Returns:
+        Path to downloaded file
+    """
+    import hashlib
+    
+    # Create unique filename based on URL hash
+    url_hash = hashlib.sha1(url.encode()).hexdigest()[:8]
+    filename = f"b{batch_idx}_v{video_idx}_{url_hash}.mp4"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / filename
+    part_path = dest_dir / f"{filename}.part"
+    
+    # Skip if already exists and has content
+    if dest_path.exists() and dest_path.stat().st_size > 0:
+        print(f"[DOWNLOAD] Batch {batch_idx}, Video {video_idx}: Already exists, skipping download: {dest_path}")
+        return str(dest_path)
+    
+    print(f"[DOWNLOAD] Batch {batch_idx}, Video {video_idx}: Downloading {url} to {dest_path}")
+    
+    with timed_operation(f"download_video_{batch_idx}_{video_idx}", {'batch_index': batch_idx, 'video_index': video_idx, 'url': url}):
+        try:
+            response = requests.get(url, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            bytes_downloaded = 0
+            with open(part_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=65536):  # 64KB chunks for fast disk writes
+                    if chunk:
+                        f.write(chunk)
+                        bytes_downloaded += len(chunk)
+            
+            # Atomic rename when complete
+            part_path.rename(dest_path)
+            
+            duration = _timing_events[-1]['duration'] if _timing_events else 0.0
+            mb_downloaded = bytes_downloaded / 1024 / 1024
+            mbps = (mb_downloaded / duration) if duration > 0 else 0.0
+            
+            print(f"[DOWNLOAD] Batch {batch_idx}, Video {video_idx}: Downloaded {mb_downloaded:.2f} MB in {duration:.2f}s ({mbps:.2f} MB/s)")
+            
+            return str(dest_path)
+        except Exception as e:
+            print(f"[DOWNLOAD] Batch {batch_idx}, Video {video_idx}: Failed to download: {e}")
+            # Clean up partial file
+            if part_path.exists():
+                part_path.unlink()
+            raise
+
+
 # Data structures for streaming pipeline
 class BatchPlan(TypedDict):
     """Plan for a batch of videos to decode."""
@@ -81,8 +144,12 @@ class BatchPlan(TypedDict):
     urls: List[str]
     perfect_reads_urls: List[str]
     local_urls: List[str]  # URLs after proxy mapping (if enabled)
-    frame_indices: List[int]
-    timestamps: List[float]
+    frame_indices: List[int]  # Legacy: single frame per video
+    timestamps: List[float]  # Legacy: single timestamp per video
+    frame_indices_per_video: List[List[int]]  # Multi-frame: N indices per video
+    timestamps_per_video: List[List[float]]  # Multi-frame: N timestamps per video
+    local_file_paths: List[str]  # Paths to downloaded segments on local disk
+    use_local_files: bool  # Whether to prefer local files over URLs
 
 
 class PreparedBatch(TypedDict):
@@ -92,6 +159,407 @@ class PreparedBatch(TypedDict):
     metadata_list: List[Dict[str, Any]]
 
 
+class VideoTask(TypedDict):
+    """Complete task for one video (HEAD + download)."""
+    batch_index: int
+    video_index: int
+    original_url: str
+    start_timestamp: float
+    end_timestamp: float
+    perfect_reads_url: str
+    local_url: Optional[str]  # Proxy URL if enabled
+
+
+class VideoResult(TypedDict):
+    """Result after HEAD + download complete."""
+    batch_index: int
+    video_index: int
+    frame_indices: List[int]
+    timestamps: List[float]
+    local_file_path: str
+    metadata: Dict[str, Any]  # fps, frame_index, etc.
+
+
+def _generate_video_tasks(
+    urls: List[str],
+    num_batches: int,
+    offset_max_seconds: float,
+    random_seed: Optional[int],
+    shared_proxy_port: Optional[int],
+    frames_per_sample: int = 1,
+    frame_stride_seconds: float = 0.16,
+) -> List[VideoTask]:
+    """Generate all video tasks upfront with deterministic timestamps.
+    
+    Args:
+        urls: List of video URLs to process
+        num_batches: Number of batches to generate
+        offset_max_seconds: Maximum timestamp offset for random frame selection
+        random_seed: Seed for reproducible timestamp selection
+        shared_proxy_port: Optional port of shared proxy server
+        frames_per_sample: Number of frames to extract per video
+        frame_stride_seconds: Time stride between frames
+        
+    Returns:
+        List of VideoTask objects for all videos across all batches
+    """
+    # Initialize RNG for deterministic timestamp generation
+    rng = random.Random(random_seed) if random_seed is not None else random.Random()
+    batch_size = len(urls)
+    
+    all_tasks: List[VideoTask] = []
+    
+    print(f"[TASK_GEN] Generating tasks for {num_batches} batches, {batch_size} videos per batch")
+    
+    for batch_idx in range(num_batches):
+        for video_idx, url in enumerate(urls):
+            # Generate random start timestamp
+            start_ts = rng.uniform(0.0, offset_max_seconds)
+            
+            # Calculate end timestamp (window for multi-frame sampling)
+            end_ts = start_ts + (frames_per_sample - 1) * frame_stride_seconds + 0.8
+            
+            # Build Perfect Reads URL
+            perfect_reads_url = build_perfect_reads_url(url, from_timestamp=start_ts, to_timestamp=end_ts)
+            
+            # Map to proxy URL if proxy is enabled
+            local_url = None
+            if shared_proxy_port is not None:
+                encoded_url = urllib.parse.quote(perfect_reads_url, safe='')
+                local_url = f"http://127.0.0.1:{shared_proxy_port}/proxy?url={encoded_url}"
+            
+            task: VideoTask = {
+                'batch_index': batch_idx,
+                'video_index': video_idx,
+                'original_url': url,
+                'start_timestamp': start_ts,
+                'end_timestamp': end_ts,
+                'perfect_reads_url': perfect_reads_url,
+                'local_url': local_url,
+            }
+            
+            all_tasks.append(task)
+            
+            if video_idx == 0:  # Log first video of each batch
+                print(f"[TASK_GEN] Batch {batch_idx}, Video {video_idx}: start={start_ts:.3f}s, end={end_ts:.3f}s")
+    
+    print(f"[TASK_GEN] Generated {len(all_tasks)} tasks total")
+    return all_tasks
+
+
+def _process_head_request(
+    task: VideoTask,
+    frames_per_sample: int,
+    frame_stride_seconds: float
+) -> Dict[str, Any]:
+    """Process a single HEAD request for a video.
+    
+    Args:
+        task: VideoTask to process
+        frames_per_sample: Number of frames to extract per video
+        frame_stride_seconds: Time stride between frames
+        
+    Returns:
+        Dictionary with frame_index, fps, frame_indices, timestamps
+    """
+    batch_idx = task['batch_index']
+    video_idx = task['video_index']
+    start_ts = task['start_timestamp']
+    
+    # Use proxy URL if available, else Perfect Reads URL
+    request_url = task['local_url'] if task['local_url'] else task['perfect_reads_url']
+    
+    with timed_operation(f"head_b{batch_idx}_v{video_idx}", {'batch_index': batch_idx, 'video_index': video_idx}):
+        # Get metadata from Perfect Reads HEAD request
+        metadata = get_perfect_reads_metadata(request_url, timeout=60.0)
+    
+    # Compute frame indices
+    k = metadata['frame_index']
+    fps = metadata['fps']
+    step = max(1, round(frame_stride_seconds * fps))
+    
+    indices = [k + n * step for n in range(frames_per_sample)]
+    ts_list = [start_ts + n * frame_stride_seconds for n in range(frames_per_sample)]
+    
+    print(f"[HEAD] Batch {batch_idx}, Video {video_idx}: k={k}, fps={fps:.2f}, step={step}, indices={indices}")
+    
+    return {
+        'frame_index': k,
+        'fps': fps,
+        'frame_indices': indices,
+        'timestamps': ts_list,
+        'timescale': metadata.get('timescale', 90000),
+        'default_sample_duration': metadata.get('default_sample_duration', 0),
+    }
+
+
+def _process_download(
+    task: VideoTask,
+    prefer_local_segments: bool
+) -> str:
+    """Download a single video segment to disk.
+    
+    Args:
+        task: VideoTask to download
+        prefer_local_segments: Whether to download segments locally
+        
+    Returns:
+        Local file path (empty string if not downloaded)
+    """
+    if not prefer_local_segments:
+        return ""
+    
+    batch_idx = task['batch_index']
+    video_idx = task['video_index']
+    perfect_reads_url = task['perfect_reads_url']
+    
+    # Create destination directory
+    dest_dir = Path("/tmp/recaller/segments") / f"batch{batch_idx}"
+    
+    try:
+        local_path = download_perfect_reads_segment(
+            perfect_reads_url,
+            dest_dir,
+            batch_idx,
+            video_idx
+        )
+        return local_path
+    except Exception as e:
+        print(f"[DOWNLOAD] Batch {batch_idx}, Video {video_idx}: Download failed, will use URL: {e}")
+        return ""
+
+
+def _concurrent_pipeline_coordinator(
+    head_queue: Queue,
+    urls: List[str],
+    num_batches: int,
+    batch_size: int,
+    offset_max_seconds: float,
+    random_seed: Optional[int],
+    shared_proxy_port: Optional[int],
+    stop_event: threading.Event,
+    frames_per_sample: int = 1,
+    frame_stride_seconds: float = 0.16,
+    prefer_local_segments: bool = False,
+    head_workers: int = 32,
+    download_workers: int = 32,
+):
+    """Coordinator thread for high-concurrency HEAD + download pipeline.
+    
+    This replaces _head_producer_thread with a high-throughput streaming architecture:
+    - Generates all timestamps upfront (deterministic)
+    - Runs HEAD requests with high concurrency (32 workers) across all batches
+    - Downloads with high concurrency (32 workers)
+    - Assembles BatchPlans as batches complete
+    
+    Args:
+        head_queue: Queue to enqueue BatchPlan objects
+        urls: List of video URLs to process
+        num_batches: Number of batches to generate
+        batch_size: Number of videos per batch
+        offset_max_seconds: Maximum timestamp offset for random frame selection
+        random_seed: Seed for reproducible timestamp selection
+        shared_proxy_port: Optional port of shared proxy server
+        stop_event: Event to signal thread shutdown
+        frames_per_sample: Number of frames to extract per video
+        frame_stride_seconds: Time stride between frames
+        prefer_local_segments: Whether to download segments to local disk
+        head_workers: Number of concurrent HEAD request workers
+        download_workers: Number of concurrent download workers
+    """
+    try:
+        print(f"[COORDINATOR] Starting with {head_workers} HEAD workers, {download_workers} download workers")
+        
+        # Stage 1: Generate all tasks upfront (deterministic timestamps)
+        print(f"[COORDINATOR] Generating all tasks for {num_batches} batches...")
+        with timed_operation("generate_all_tasks", {'num_batches': num_batches, 'batch_size': batch_size}):
+            all_tasks = _generate_video_tasks(
+                urls=urls,
+                num_batches=num_batches,
+                offset_max_seconds=offset_max_seconds,
+                random_seed=random_seed,
+                shared_proxy_port=shared_proxy_port,
+                frames_per_sample=frames_per_sample,
+                frame_stride_seconds=frame_stride_seconds,
+            )
+        
+        # Storage for results: {(batch_idx, video_idx): VideoResult}
+        results: Dict[Tuple[int, int], VideoResult] = {}
+        results_lock = threading.Lock()
+        
+        # Track which batches are complete
+        batch_completion: Dict[int, int] = {i: 0 for i in range(num_batches)}  # batch_idx -> count of completed videos
+        batch_completion_lock = threading.Lock()
+        
+        # Track which batches have been enqueued
+        batches_enqueued: Dict[int, bool] = {i: False for i in range(num_batches)}
+        batches_enqueued_lock = threading.Lock()
+        
+        def _try_enqueue_batch(batch_idx: int):
+            """Try to enqueue a batch if all its videos are complete and it hasn't been enqueued yet."""
+            with batches_enqueued_lock:
+                if batches_enqueued[batch_idx]:
+                    return  # Already enqueued
+                
+                # Check if batch is complete
+                with batch_completion_lock:
+                    if batch_completion[batch_idx] < batch_size:
+                        return  # Not ready yet
+                
+                # Mark as enqueued
+                batches_enqueued[batch_idx] = True
+            
+            # Assemble and enqueue BatchPlan
+            print(f"[COORDINATOR] Batch {batch_idx}: All videos complete, assembling BatchPlan...")
+            
+            # Collect results for this batch
+            perfect_reads_urls = []
+            local_urls = []
+            frame_indices_per_video = []
+            timestamps_per_video = []
+            local_file_paths = []
+            
+            for video_idx in range(batch_size):
+                with results_lock:
+                    result = results[(batch_idx, video_idx)]
+                
+                # Get task info
+                task = all_tasks[batch_idx * batch_size + video_idx]
+                perfect_reads_urls.append(task['perfect_reads_url'])
+                local_urls.append(task['local_url'] if task['local_url'] else task['perfect_reads_url'])
+                
+                # Get result info
+                frame_indices_per_video.append(result['frame_indices'])
+                timestamps_per_video.append(result['timestamps'])
+                local_file_paths.append(result['local_file_path'])
+            
+            # Legacy fields (use first frame)
+            frame_indices = [indices[0] for indices in frame_indices_per_video]
+            timestamps = [ts_list[0] for ts_list in timestamps_per_video]
+            
+            # Determine if we should use local files
+            use_local_files = prefer_local_segments and any(p for p in local_file_paths)
+            
+            # Create BatchPlan
+            batch_plan: BatchPlan = {
+                'batch_index': batch_idx,
+                'urls': urls.copy(),
+                'perfect_reads_urls': perfect_reads_urls,
+                'local_urls': local_urls,
+                'frame_indices': frame_indices,
+                'timestamps': timestamps,
+                'frame_indices_per_video': frame_indices_per_video,
+                'timestamps_per_video': timestamps_per_video,
+                'local_file_paths': local_file_paths,
+                'use_local_files': use_local_files,
+            }
+            
+            print(f"[COORDINATOR] Batch {batch_idx}: Enqueuing BatchPlan (queue size: {head_queue.qsize()})...")
+            head_queue.put(batch_plan)
+            print(f"[COORDINATOR] Batch {batch_idx}: BatchPlan enqueued")
+        
+        # Stage 2 & 3: Run HEAD and download operations concurrently with immediate batch enqueueing
+        print(f"[COORDINATOR] Starting {head_workers} HEAD workers and {download_workers} download workers...")
+        
+        # Create both executors upfront - they'll run concurrently
+        head_executor = ThreadPoolExecutor(max_workers=head_workers, thread_name_prefix="HEAD")
+        download_executor = ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="DOWNLOAD")
+        
+        try:
+            # Submit all HEAD tasks immediately
+            print(f"[COORDINATOR] Submitting {len(all_tasks)} HEAD requests...")
+            head_futures = {}
+            for task in all_tasks:
+                future = head_executor.submit(_process_head_request, task, frames_per_sample, frame_stride_seconds)
+                head_futures[future] = task
+            
+            # Track pending operations: HEAD futures and download futures
+            pending_futures = set(head_futures.keys())
+            download_futures = {}  # download_future -> (task, head_metadata)
+            
+            print(f"[COORDINATOR] Monitoring {len(pending_futures)} operations (will grow as downloads start)...")
+            
+            # Process completions as they happen (HEAD or download, doesn't matter)
+            while pending_futures and not stop_event.is_set():
+                # Wait for any future to complete (HEAD or download)
+                done, pending_futures = wait(pending_futures, timeout=0.1, return_when=FIRST_COMPLETED)
+                
+                for future in done:
+                    # Is this a HEAD future or download future?
+                    if future in head_futures:
+                        # HEAD completed - submit download
+                        task = head_futures[future]
+                        batch_idx = task['batch_index']
+                        video_idx = task['video_index']
+                        
+                        try:
+                            head_metadata = future.result()
+                            
+                            # Submit download immediately
+                            download_future = download_executor.submit(_process_download, task, prefer_local_segments)
+                            download_futures[download_future] = (task, head_metadata)
+                            pending_futures.add(download_future)
+                            
+                            print(f"[COORDINATOR] HEAD complete for batch {batch_idx}, video {video_idx} - download started")
+                            
+                        except Exception as e:
+                            print(f"[COORDINATOR] HEAD failed for batch {batch_idx}, video {video_idx}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            stop_event.set()
+                    
+                    elif future in download_futures:
+                        # Download completed - store result and try to enqueue batch
+                        task, head_metadata = download_futures[future]
+                        batch_idx = task['batch_index']
+                        video_idx = task['video_index']
+                        
+                        try:
+                            local_file_path = future.result()
+                            
+                            # Store complete result
+                            result: VideoResult = {
+                                'batch_index': batch_idx,
+                                'video_index': video_idx,
+                                'frame_indices': head_metadata['frame_indices'],
+                                'timestamps': head_metadata['timestamps'],
+                                'local_file_path': local_file_path,
+                                'metadata': head_metadata,
+                            }
+                            
+                            with results_lock:
+                                results[(batch_idx, video_idx)] = result
+                            
+                            # Update batch completion counter
+                            with batch_completion_lock:
+                                batch_completion[batch_idx] += 1
+                                completed_count = batch_completion[batch_idx]
+                            
+                            print(f"[COORDINATOR] Download complete for batch {batch_idx}, video {video_idx} ({completed_count}/{batch_size})")
+                            
+                            # Try to enqueue this batch immediately if it's now complete
+                            _try_enqueue_batch(batch_idx)
+                            
+                        except Exception as e:
+                            print(f"[COORDINATOR] Download failed for batch {batch_idx}, video {video_idx}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            stop_event.set()
+            
+            print(f"[COORDINATOR] All HEAD and download operations complete")
+            print(f"[COORDINATOR] Finished producing {num_batches} batches")
+            
+        finally:
+            # Clean up executors
+            head_executor.shutdown(wait=True)
+            download_executor.shutdown(wait=True)
+    except Exception as e:
+        print(f"[COORDINATOR] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        stop_event.set()
+
+
 def _head_producer_thread(
     head_queue: Queue,
     urls: List[str],
@@ -99,7 +567,10 @@ def _head_producer_thread(
     offset_max_seconds: float,
     random_seed: Optional[int],
     shared_proxy_port: Optional[int],
-    stop_event: threading.Event
+    stop_event: threading.Event,
+    frames_per_sample: int = 1,
+    frame_stride_seconds: float = 0.16,
+    prefer_local_segments: bool = False
 ):
     """Producer thread that generates BatchPlans with HEAD requests.
     
@@ -125,17 +596,21 @@ def _head_producer_thread(
                 break
             
             with timed_operation(f"head_batch_{batch_idx}", {'batch_index': batch_idx, 'num_videos': batch_size}):
-                # Generate random timestamps for this batch
-                timestamps = [rng.uniform(0.0, offset_max_seconds) for _ in urls]
+                # Generate random start timestamps for this batch
+                start_timestamps = [rng.uniform(0.0, offset_max_seconds) for _ in urls]
                 
                 print(f"[HEAD_PRODUCER] Batch {batch_idx}: Generating timestamps and Perfect Reads URLs...")
-                for idx, ts in enumerate(timestamps):
-                    print(f"[HEAD_PRODUCER] Batch {batch_idx}, Video {idx} - timestamp: {ts:.3f}s")
+                for idx, ts in enumerate(start_timestamps):
+                    print(f"[HEAD_PRODUCER] Batch {batch_idx}, Video {idx} - start timestamp: {ts:.3f}s, frames_per_sample: {frames_per_sample}")
                 
-                # Build Perfect Reads URLs
+                # Build Perfect Reads URLs with time window for multi-frame sampling
                 perfect_reads_urls = []
-                for url, ts in zip(urls, timestamps):
-                    pr_url = build_perfect_reads_url(url, from_timestamp=ts, to_timestamp=ts)
+                for url, t0 in zip(urls, start_timestamps):
+                    # Window spans from t0 to t0 + (N-1)*stride + generous padding
+                    # Add extra padding to reduce fragment count and ensure enough frames
+                    # At 30fps, 5 frame steps at 0.16s = 0.8s, add 0.8s buffer for ~1.6s window ≈ 48 frames
+                    to_ts = t0 + (frames_per_sample - 1) * frame_stride_seconds + 0.8
+                    pr_url = build_perfect_reads_url(url, from_timestamp=t0, to_timestamp=to_ts)
                     perfect_reads_urls.append(pr_url)
                 
                 # Map to proxy URLs if needed
@@ -148,40 +623,103 @@ def _head_producer_thread(
                 else:
                     local_urls = perfect_reads_urls.copy()
                 
-                # Perform concurrent HEAD requests per video
-                frame_indices = [0] * batch_size
+                # Perform concurrent HEAD requests per video to get metadata
+                frame_indices_per_video = [[0]] * batch_size  # Will be replaced
+                timestamps_per_video = [[0.0]] * batch_size  # Will be replaced
                 
-                def _fetch_head(idx: int, local_url: str) -> Tuple[int, int]:
-                    """Fetch HEAD request for a single video."""
+                def _fetch_head(idx: int, local_url: str, t0: float) -> Tuple[int, List[int], List[float]]:
+                    """Fetch HEAD request and compute frame indices for a single video."""
                     with timed_operation(f"head_video_{batch_idx}_{idx}", {'batch_index': batch_idx, 'video_index': idx}):
-                        frame_index = get_perfect_reads_frame_index(local_url, timeout=60.0)
-                    return idx, frame_index
+                        metadata = get_perfect_reads_metadata(local_url, timeout=60.0)
+                    
+                    # Compute frame indices
+                    k = metadata['frame_index']
+                    fps = metadata['fps']
+                    step = max(1, round(frame_stride_seconds * fps))
+                    
+                    indices = [k + n * step for n in range(frames_per_sample)]
+                    ts_list = [t0 + n * frame_stride_seconds for n in range(frames_per_sample)]
+                    
+                    print(f"[HEAD_PRODUCER] Batch {batch_idx}, Video {idx}: k={k}, fps={fps:.2f}, step={step}, indices={indices}")
+                    return idx, indices, ts_list
                 
                 max_workers = min(batch_size, 4)
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {
-                        executor.submit(_fetch_head, idx, local_url): idx
+                        executor.submit(_fetch_head, idx, local_url, start_timestamps[idx]): idx
                         for idx, local_url in enumerate(local_urls)
                     }
                     for future in as_completed(futures):
-                        idx, frame_index = future.result()
-                        frame_indices[idx] = frame_index
+                        idx, indices, ts_list = future.result()
+                        frame_indices_per_video[idx] = indices
+                        timestamps_per_video[idx] = ts_list
                 
-                print(f"[HEAD_PRODUCER] Batch {batch_idx}: HEAD requests completed, frame_indices={frame_indices}")
+                print(f"[HEAD_PRODUCER] Batch {batch_idx}: HEAD requests completed")
                 
-                # Create BatchPlan and enqueue (blocks if queue is full - backpressure)
-                batch_plan: BatchPlan = {
-                    'batch_index': batch_idx,
-                    'urls': urls.copy(),
-                    'perfect_reads_urls': perfect_reads_urls,
-                    'local_urls': local_urls,
-                    'frame_indices': frame_indices,
-                    'timestamps': timestamps,
-                }
-                
-                print(f"[HEAD_PRODUCER] Batch {batch_idx}: Enqueuing BatchPlan (queue size: {head_queue.qsize()})...")
-                head_queue.put(batch_plan)
-                print(f"[HEAD_PRODUCER] Batch {batch_idx}: BatchPlan enqueued")
+                # Legacy fields for backward compatibility (use first frame)
+                frame_indices = [indices[0] for indices in frame_indices_per_video]
+                timestamps = [ts_list[0] for ts_list in timestamps_per_video]
+            
+            # Download segments to local disk if requested (outside head_batch timing)
+            local_file_paths: List[str] = []
+            use_local_files = False
+            
+            if prefer_local_segments:
+                print(f"[HEAD_PRODUCER] Batch {batch_idx}: Downloading segments to local disk...")
+                with timed_operation(f"download_batch_{batch_idx}", {'batch_index': batch_idx, 'num_videos': batch_size}):
+                    from pathlib import Path
+                    dest_dir = Path("/tmp/recaller/segments") / f"batch{batch_idx}"
+                    
+                    def _download_segment(idx: int, pr_url: str) -> Tuple[int, str]:
+                        """Download a single segment."""
+                        try:
+                            local_path = download_perfect_reads_segment(pr_url, dest_dir, batch_idx, idx)
+                            return idx, local_path
+                        except Exception as e:
+                            print(f"[HEAD_PRODUCER] Batch {batch_idx}, Video {idx}: Download failed, will use URL: {e}")
+                            return idx, ""
+                    
+                    # Download segments concurrently (max 4 workers)
+                    local_file_paths = [""] * batch_size
+                    max_workers = min(batch_size, 4)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(_download_segment, idx, perfect_reads_urls[idx]): idx
+                            for idx in range(batch_size)
+                        }
+                        for future in as_completed(futures):
+                            idx, local_path = future.result()
+                            local_file_paths[idx] = local_path
+                    
+                    # Check if we got at least some downloads
+                    successful_downloads = sum(1 for p in local_file_paths if p)
+                    if successful_downloads > 0:
+                        use_local_files = True
+                        total_mb = sum(
+                            Path(p).stat().st_size / 1024 / 1024
+                            for p in local_file_paths if p and Path(p).exists()
+                        )
+                        print(f"[HEAD_PRODUCER] Batch {batch_idx}: Downloaded {successful_downloads}/{batch_size} segments ({total_mb:.2f} MB total)")
+                    else:
+                        print(f"[HEAD_PRODUCER] Batch {batch_idx}: No segments downloaded, will use URLs")
+            
+            # Create BatchPlan and enqueue (blocks if queue is full - backpressure)
+            batch_plan: BatchPlan = {
+                'batch_index': batch_idx,
+                'urls': urls.copy(),
+                'perfect_reads_urls': perfect_reads_urls,
+                'local_urls': local_urls,
+                'frame_indices': frame_indices,
+                'timestamps': timestamps,
+                'frame_indices_per_video': frame_indices_per_video,
+                'timestamps_per_video': timestamps_per_video,
+                'local_file_paths': local_file_paths,
+                'use_local_files': use_local_files,
+            }
+            
+            print(f"[HEAD_PRODUCER] Batch {batch_idx}: Enqueuing BatchPlan (queue size: {head_queue.qsize()})...")
+            head_queue.put(batch_plan)
+            print(f"[HEAD_PRODUCER] Batch {batch_idx}: BatchPlan enqueued")
         
         print(f"[HEAD_PRODUCER] Finished producing {num_batches} batches")
     except Exception as e:
@@ -246,32 +784,51 @@ def _decode_preprocess_thread(
             batch_idx = batch_plan['batch_index']
             urls = batch_plan['urls']
             local_urls = batch_plan['local_urls']
-            frame_indices = batch_plan['frame_indices']
-            timestamps = batch_plan['timestamps']
+            frame_indices_per_video = batch_plan['frame_indices_per_video']
+            timestamps_per_video = batch_plan['timestamps_per_video']
+            local_file_paths = batch_plan['local_file_paths']
+            use_local_files = batch_plan['use_local_files']
             batch_size = len(urls)
             
-            print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Starting decode+preprocess for {batch_size} videos")
+            frames_per_sample = len(frame_indices_per_video[0]) if frame_indices_per_video else 1
+            total_samples = batch_size * frames_per_sample
             
-            with timed_operation(f"decode_batch_{batch_idx}", {'batch_index': batch_idx, 'num_videos': batch_size}):
-                decoded_tensors = [None] * batch_size
-                metadata_list = [None] * batch_size
+            print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Starting decode+preprocess for {batch_size} videos x {frames_per_sample} frames = {total_samples} samples")
+            
+            with timed_operation(f"decode_batch_{batch_idx}", {'batch_index': batch_idx, 'num_videos': batch_size, 'frames_per_video': frames_per_sample}):
+                # Flatten: decode all frames across all videos
+                decoded_tensors = []
+                metadata_list = []
                 
                 # Decode videos concurrently using CUDA streams (NOT Python threads)
-                for idx, (local_url, frame_idx) in enumerate(zip(local_urls, frame_indices)):
-                    with timed_operation(f"decode_video_{batch_idx}_{idx}", {'batch_index': batch_idx, 'video_index': idx}):
+                for video_idx, local_url in enumerate(local_urls):
+                    indices_for_video = frame_indices_per_video[video_idx]
+                    timestamps_for_video = timestamps_per_video[video_idx]
+                    
+                    # Choose decoder input: prefer local file if available, else use URL
+                    decoder_input = local_url
+                    input_source_type = "URL"
+                    if use_local_files and video_idx < len(local_file_paths) and local_file_paths[video_idx]:
+                        from pathlib import Path
+                        local_file = local_file_paths[video_idx]
+                        if Path(local_file).exists():
+                            decoder_input = local_file
+                            input_source_type = "local file"
+                    
+                    with timed_operation(f"decode_video_{batch_idx}_{video_idx}", {'batch_index': batch_idx, 'video_index': video_idx, 'num_frames': len(indices_for_video), 'source': input_source_type}):
                         decode_start = time.time()
                         
                         # Assign stream in round-robin fashion
-                        stream_idx = idx % max_concurrent_decodes
+                        stream_idx = video_idx % max_concurrent_decodes
                         stream = cuda_streams[stream_idx]
                         
                         # Use stream-specific context for GPU work
                         with torch.cuda.stream(stream):
                             # Get or create decoder for this stream (one decoder per stream)
                             if stream_idx not in decoder_pool:
-                                print(f"[DECODE_PREPROCESS] Creating new decoder for stream {stream_idx}")
+                                print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {video_idx}: Creating new decoder for stream {stream_idx} from {input_source_type}")
                                 decoder_pool[stream_idx] = pynvc.CreateSimpleDecoder(
-                                    local_url,
+                                    decoder_input,
                                     gpuid=0,
                                     useDeviceMemory=True,
                                     outputColorType=pynvc.OutputColorType.RGB,
@@ -279,62 +836,69 @@ def _decode_preprocess_thread(
                                     decoderCacheSize=4,
                                     bWaitForSessionWarmUp=False,
                                 )
-                                decoder_last_url[stream_idx] = local_url
-                            elif decoder_last_url.get(stream_idx) != local_url:
-                                # Different URL - reconfigure existing decoder
-                                print(f"[DECODE_PREPROCESS] Reconfiguring decoder on stream {stream_idx} for new URL")
-                                decoder_pool[stream_idx].reconfigure_decoder(local_url)
-                                decoder_last_url[stream_idx] = local_url
+                                decoder_last_url[stream_idx] = decoder_input
+                            elif decoder_last_url.get(stream_idx) != decoder_input:
+                                # Different input - reconfigure existing decoder
+                                print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {video_idx}: Reconfiguring decoder on stream {stream_idx} for new {input_source_type}")
+                                decoder_pool[stream_idx].reconfigure_decoder(decoder_input)
+                                decoder_last_url[stream_idx] = decoder_input
                             else:
-                                # Same URL - reuse decoder as-is
-                                print(f"[DECODE_PREPROCESS] Reusing decoder on stream {stream_idx} (same URL)")
+                                # Same input - reuse decoder as-is
+                                print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {video_idx}: Reusing decoder on stream {stream_idx} (same {input_source_type})")
                             
                             decoder = decoder_pool[stream_idx]
                             
-                            # Decode frame at the specified index
-                            frame_obj = decoder[frame_idx]
-                            
-                            # Get metadata
+                            # Get metadata once per video
                             meta = decoder.get_stream_metadata()
                             width = meta.width
                             height = meta.height
                             
-                            # Convert to PyTorch tensor via DLPack (zero-copy on GPU)
-                            # Tensor will be on the correct CUDA stream
-                            tensor = torch.from_dlpack(frame_obj)
+                            # Decode all frames for this video (with error handling for missing frames)
+                            for clip_frame_idx, (frame_idx, timestamp) in enumerate(zip(indices_for_video, timestamps_for_video)):
+                                try:
+                                    # Decode frame at the specified index
+                                    frame_obj = decoder[frame_idx]
+                                    
+                                    # Convert to PyTorch tensor via DLPack (zero-copy on GPU)
+                                    # Tensor will be on the correct CUDA stream
+                                    tensor = torch.from_dlpack(frame_obj)
+                                    
+                                    metadata = {
+                                        'batch_index': batch_idx,
+                                        'video_index': video_idx,
+                                        'clip_frame_index': clip_frame_idx,
+                                        'video_url': urls[video_idx],
+                                        'selected_timestamp_seconds': timestamp,
+                                        'frame_index': frame_idx,
+                                        'width': width,
+                                        'height': height,
+                                    }
+                                    
+                                    decoded_tensors.append(tensor)
+                                    metadata_list.append(metadata)
+                                except (IndexError, RuntimeError) as e:
+                                    print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {video_idx}, Frame {clip_frame_idx}: Failed to decode frame index {frame_idx}: {e}")
+                                    print(f"[DECODE_PREPROCESS] Skipping frame {clip_frame_idx} for video {video_idx}")
                             
                             decode_time = time.time() - decode_start
-                            
-                            metadata = {
-                                'batch_index': batch_idx,
-                                'video_index': idx,
-                                'video_url': urls[idx],
-                                'selected_timestamp_seconds': timestamps[idx],
-                                'frame_index': frame_idx,
-                                'width': width,
-                                'height': height,
-                                'decode_time_seconds': decode_time,
-                            }
-                            
-                            decoded_tensors[idx] = tensor
-                            metadata_list[idx] = metadata
-                            
-                            print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {idx} decoded on stream {stream_idx}: {width}x{height}, {decode_time:.2f}s")
+                            print(f"[DECODE_PREPROCESS] Batch {batch_idx}, Video {video_idx} decoded {len(indices_for_video)} frames on stream {stream_idx}: {width}x{height}, {decode_time:.2f}s")
                 
                 # Synchronize all streams before preprocessing to ensure all decodes are complete
                 print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Synchronizing all CUDA streams...")
                 for stream in cuda_streams:
                     stream.synchronize()
             
-            # Check if any decodes failed
-            if any(t is None for t in decoded_tensors):
-                print(f"[DECODE_PREPROCESS] Batch {batch_idx}: One or more videos failed to decode")
+            # Check if we got at least some frames (allow partial failure for missing frames)
+            if len(decoded_tensors) == 0:
+                print(f"[DECODE_PREPROCESS] Batch {batch_idx}: No frames decoded successfully, stopping")
                 stop_event.set()
                 continue
+            elif len(decoded_tensors) < total_samples:
+                print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Expected {total_samples} samples but got {len(decoded_tensors)} (some frames missing/failed)")
             
             # Preprocess on GPU
-            print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Preprocessing on GPU...")
-            with timed_operation(f"preprocess_batch_{batch_idx}", {'batch_index': batch_idx}):
+            print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Preprocessing {len(decoded_tensors)} samples on GPU...")
+            with timed_operation(f"preprocess_batch_{batch_idx}", {'batch_index': batch_idx, 'num_samples': len(decoded_tensors)}):
                 preprocessed_tensors = []
                 
                 for tensor in decoded_tensors:
@@ -352,8 +916,8 @@ def _decode_preprocess_thread(
                     
                     preprocessed_tensors.append(x.squeeze(0))  # (3, 224, 224)
                 
-                # Stack into batch tensor
-                input_tensor_cuda = torch.stack(preprocessed_tensors, dim=0)  # (B, 3, 224, 224)
+                # Stack into batch tensor - now B*N samples
+                input_tensor_cuda = torch.stack(preprocessed_tensors, dim=0)  # (B*N, 3, 224, 224)
             
             print(f"[DECODE_PREPROCESS] Batch {batch_idx}: Preprocessing complete, tensor shape: {input_tensor_cuda.shape}")
             
@@ -602,6 +1166,39 @@ def get_perfect_reads_frame_index(perfect_reads_url: str, timeout: float = 60.0)
     
     print(f"[PERFECT_READS] Got X-Start-Frame-Index: {frame_index}")
     return frame_index
+
+
+def get_perfect_reads_metadata(perfect_reads_url: str, timeout: float = 60.0) -> Dict[str, Any]:
+    """Get extended metadata from Perfect Reads HEAD request.
+    
+    Args:
+        perfect_reads_url: Perfect Reads Worker URL
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Dictionary with frame_index, timescale, default_sample_duration, fps
+    """
+    print(f"[PERFECT_READS] Fetching HEAD metadata from: {perfect_reads_url}")
+    resp = requests.head(perfect_reads_url, timeout=timeout)
+    resp.raise_for_status()
+    
+    frame_index = int(resp.headers.get('X-Start-Frame-Index', '0'))
+    timescale = int(resp.headers.get('X-Timescale', '90000'))
+    default_sample_duration = int(resp.headers.get('X-Default-Sample-Duration', '0'))
+    
+    # Compute fps from timescale and sample duration
+    fps = 30.0  # Fallback
+    if default_sample_duration > 0:
+        fps = timescale / default_sample_duration
+    
+    print(f"[PERFECT_READS] Got metadata: frame_index={frame_index}, timescale={timescale}, default_sample_duration={default_sample_duration}, fps={fps:.2f}")
+    
+    return {
+        'frame_index': frame_index,
+        'timescale': timescale,
+        'default_sample_duration': default_sample_duration,
+        'fps': fps,
+    }
 
 
 def detect_platform() -> str:
@@ -985,6 +1582,12 @@ def _run_inference_cuda_streaming(
     model_load_time: float,
     wandb_available: bool,
     return_frame_png: bool,
+    frames_per_sample: int = 1,
+    frame_stride_seconds: float = 0.16,
+    prefer_local_segments: bool = False,
+    head_workers: int = 32,
+    download_workers: int = 32,
+    minimum_inference_time_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Run CUDA inference using streaming pipeline with bounded buffers.
     
@@ -1012,6 +1615,7 @@ def _run_inference_cuda_streaming(
     import torch
     
     print("[CUDA_STREAMING] Starting CUDA streaming pipeline")
+    print(f"[CUDA_STREAMING] Local decode mode: {prefer_local_segments}")
     
     # Set up shared proxy once for entire pipeline (if needed)
     shared_proxy_server = None
@@ -1035,15 +1639,18 @@ def _run_inference_cuda_streaming(
     tensor_queue: Queue = Queue(maxsize=max_buffer_batches)
     stop_event = threading.Event()
     
-    # Start producer and worker threads
-    print("[CUDA_STREAMING] Starting HEAD producer thread...")
-    head_thread = threading.Thread(
-        target=_head_producer_thread,
-        args=(head_queue, urls, num_batches, offset_max_seconds, random_seed, shared_proxy_port, stop_event),
-        name="HEAD_Producer",
+    # Worker pool sizes configured via parameters (defaults: 32 HEAD, 32 download)
+    print(f"[CUDA_STREAMING] Worker configuration: {head_workers} HEAD workers, {download_workers} download workers")
+    
+    # Start coordinator and worker threads
+    print("[CUDA_STREAMING] Starting concurrent pipeline coordinator...")
+    coordinator_thread = threading.Thread(
+        target=_concurrent_pipeline_coordinator,
+        args=(head_queue, urls, num_batches, batch_size, offset_max_seconds, random_seed, shared_proxy_port, stop_event, frames_per_sample, frame_stride_seconds, prefer_local_segments, head_workers, download_workers),
+        name="Pipeline_Coordinator",
         daemon=True
     )
-    head_thread.start()
+    coordinator_thread.start()
     
     print("[CUDA_STREAMING] Starting decode+preprocess worker thread...")
     decode_thread = threading.Thread(
@@ -1078,12 +1685,21 @@ def _run_inference_cuda_streaming(
         input_tensor_cuda = prepared_batch['input_tensor_cuda']
         metadata_list = prepared_batch['metadata_list']
         timestamps = [meta['selected_timestamp_seconds'] for meta in metadata_list]
+        num_samples = len(metadata_list)
         
         # Run inference
-        print(f"[CUDA_STREAMING] Batch {batch_idx}: Running inference...")
-        with timed_operation(f"inference_batch_{batch_idx}", {'batch_index': batch_idx, 'num_samples': batch_size}):
+        print(f"[CUDA_STREAMING] Batch {batch_idx}: Running inference on {num_samples} samples...")
+        with timed_operation(f"inference_batch_{batch_idx}", {'batch_index': batch_idx, 'num_samples': num_samples}):
+            inference_start = time.time()
             with torch.no_grad():
                 output = model(input_tensor_cuda)
+            inference_elapsed = time.time() - inference_start
+            
+            # Sleep to meet minimum inference time if needed (for workload simulation)
+            if minimum_inference_time_seconds > 0 and inference_elapsed < minimum_inference_time_seconds:
+                sleep_duration = minimum_inference_time_seconds - inference_elapsed
+                print(f"[CUDA_STREAMING] Batch {batch_idx}: Inference took {inference_elapsed:.4f}s, sleeping {sleep_duration:.4f}s to meet minimum {minimum_inference_time_seconds:.2f}s")
+                time.sleep(sleep_duration)
         
         inference_time = _timing_events[-1]['duration']
         total_inference_time += inference_time
@@ -1096,7 +1712,10 @@ def _run_inference_cuda_streaming(
         top_class_list = top_class.squeeze(1).detach().cpu().tolist()
         
         for idx, (cls, prob, ts) in enumerate(zip(top_class_list, top_prob_list, timestamps)):
-            print(f"[CUDA_STREAMING] Batch {batch_idx}, Sample {idx}: class={cls}, confidence={prob:.4f}, timestamp={ts:.3f}s")
+            meta = metadata_list[idx]
+            video_idx = meta.get('video_index', idx // frames_per_sample)
+            clip_frame_idx = meta.get('clip_frame_index', idx % frames_per_sample)
+            print(f"[CUDA_STREAMING] Batch {batch_idx}, Sample {idx} (video {video_idx}, frame {clip_frame_idx}): class={cls}, confidence={prob:.4f}, timestamp={ts:.3f}s")
         
         # Store batch results
         batch_result = {
@@ -1119,11 +1738,11 @@ def _run_inference_cuda_streaming(
     stop_event.set()
     
     print("[CUDA_STREAMING] Waiting for threads to finish...")
-    head_thread.join(timeout=5)
+    coordinator_thread.join(timeout=5)
     decode_thread.join(timeout=5)
     
-    if head_thread.is_alive():
-        print("[CUDA_STREAMING] Warning: HEAD producer thread did not finish")
+    if coordinator_thread.is_alive():
+        print("[CUDA_STREAMING] Warning: Pipeline coordinator thread did not finish")
     if decode_thread.is_alive():
         print("[CUDA_STREAMING] Warning: Decode/preprocess thread did not finish")
     
@@ -1323,7 +1942,13 @@ def run_inference_impl(
     random_seed: Optional[int] = 42,
     offset_max_seconds: float = 10.0,
     num_batches: int = 1,
-    return_frame_png: bool = False
+    return_frame_png: bool = False,
+    frames_per_sample: int = 1,
+    frame_stride_seconds: float = 0.16,
+    prefer_local_segments: bool = False,
+    head_workers: int = 32,
+    download_workers: int = 32,
+    minimum_inference_time_seconds: float = 0.0,
 ) -> Dict[str, Any]:
     """Run inference with automatic platform detection.
 
@@ -1335,6 +1960,12 @@ def run_inference_impl(
         offset_max_seconds: Maximum timestamp offset (in seconds) for random frame selection.
         num_batches: Number of batches to run, each with different random timestamps per video.
         return_frame_png: When True, includes decoded frame(s) as PNG byte data in the result.
+        frames_per_sample: Number of frames to extract per video.
+        frame_stride_seconds: Time stride between frames in seconds.
+        prefer_local_segments: When True, downloads video segments to local disk before decoding.
+        head_workers: Number of concurrent HEAD request workers (default: 32).
+        download_workers: Number of concurrent download workers (default: 32).
+        minimum_inference_time_seconds: Minimum time for inference step; sleeps to meet minimum if inference is faster (default: 0.0).
 
     Returns:
         Dictionary with batched inference results and metrics.
@@ -1427,6 +2058,12 @@ def run_inference_impl(
             model_load_time=model_load_time,
             wandb_available=wandb_available,
             return_frame_png=return_frame_png,
+            frames_per_sample=frames_per_sample,
+            frame_stride_seconds=frame_stride_seconds,
+            prefer_local_segments=prefer_local_segments,
+            head_workers=head_workers,
+            download_workers=download_workers,
+            minimum_inference_time_seconds=minimum_inference_time_seconds,
         )
     
     # Non-CUDA path (Mac/CPU) - legacy pipeline

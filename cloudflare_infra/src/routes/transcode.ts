@@ -49,50 +49,26 @@ export async function handleTranscodePut(
     // Log for debugging
     console.log('Generating presigned URL:', { bucketName, objectKey, accountId: accountId.substring(0, 8) + '...' });
     
-    // Generate presigned URLs for all outputs
-    const presignedUrlEventually = generatePresignedR2Url(
-      bucketName,
-      objectKey,
-      accountId,
-      accessKeyId,
-      secretAccessKey,
-      3600 // 1 hour expiry
-    );
-
-    const fragmentedPresignedUrl = generatePresignedR2Url(
-      bucketName,
-      fragmentedObjectKey,
-      accountId,
-      accessKeyId,
-      secretAccessKey,
-      3600
-    );
-
-    const sidecarSqlitePresignedUrl = generatePresignedR2Url(
-      bucketName,
-      fragmentedObjectKey + ".index.sqlite",
-      accountId,
-      accessKeyId,
-      secretAccessKey,
-      3600
-    );
-    
-    const sidecarJsonPresignedUrl = generatePresignedR2Url(
-      bucketName,
-      fragmentedObjectKey + ".index.json",
-      accountId,
-      accessKeyId,
-      secretAccessKey,
-      3600
-    );
+    // Generate all presigned URLs concurrently for faster response
+    const [
+      presignedUrl,
+      fragmentedPresignedUrl,
+      sidecarSqlitePresignedUrl,
+      sidecarJsonPresignedUrl
+    ] = await Promise.all([
+      generatePresignedR2Url(bucketName, objectKey, accountId, accessKeyId, secretAccessKey, 3600),
+      generatePresignedR2Url(bucketName, fragmentedObjectKey, accountId, accessKeyId, secretAccessKey, 3600),
+      generatePresignedR2Url(bucketName, fragmentedObjectKey + ".index.sqlite", accountId, accessKeyId, secretAccessKey, 3600),
+      generatePresignedR2Url(bucketName, fragmentedObjectKey + ".index.json", accountId, accessKeyId, secretAccessKey, 3600)
+    ]);
     
     // Create new request body with presigned URLs
     const forwardBody: TranscodeForwardBody = {
       youtube_url: youtubeUrl,
-      to_url_faststart: await presignedUrlEventually,
-      to_url_fragmented: await fragmentedPresignedUrl,
-      to_url_sidecar: await sidecarSqlitePresignedUrl,
-      to_url_sidecar_json: await sidecarJsonPresignedUrl,
+      to_url_faststart: presignedUrl,
+      to_url_fragmented: fragmentedPresignedUrl,
+      to_url_sidecar: sidecarSqlitePresignedUrl,
+      to_url_sidecar_json: sidecarJsonPresignedUrl,
       object_key: objectKey,
     };
     

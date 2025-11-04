@@ -41,8 +41,11 @@ export async function routePerfectRead(
       // Compute headers fast, schedule pre-warm in background
       const { bucket, key, fromSeconds, toSeconds } = perfectReadParams;
       const r2 = bucket.includes("private") ? (env as any).REC_PRIVATE : (env as any).REC_PUBLIC;
-      const { initLen } = await MP4InitReader.getInitLength(r2, key);
-      const plan = await sidecarReader.planWindow({ r2, key, fromSeconds, toSeconds, initLen } as any);
+      // Parallelize independent R2 reads for faster response
+      const [{ initLen }, plan] = await Promise.all([
+        MP4InitReader.getInitLength(r2, key),
+        sidecarReader.planWindow({ r2, key, fromSeconds, toSeconds, initLen: undefined } as any)
+      ]);
       const totalLength = initLen + plan.fragments
         .slice(plan.startFragmentIdx, plan.endFragmentIdx + 1)
         .reduce((s, f) => s + f.moofSize + f.mdatSize, 0);
@@ -64,6 +67,9 @@ export async function routePerfectRead(
           "Content-Length": String(totalLength),
           "Accept-Ranges": "bytes",
           "X-Start-Frame-Index": String(plan.startFrameIndex),
+          "X-Timescale": String(plan.timescale),
+          "X-Default-Sample-Duration": String(plan.defaultSampleDuration ?? 0),
+          "X-Frame-Duration-Seconds": String(plan.defaultSampleDuration ? plan.defaultSampleDuration / plan.timescale : 0),
           "Cache-Control": "public, max-age=86400",
         },
       });
@@ -76,7 +82,10 @@ export async function routePerfectRead(
       const { bucket, key, fromSeconds, toSeconds } = perfectReadParams;
       console.log(`[PerfectRead][GET] bucket=${bucket} key=${key} from=${fromSeconds} to=${toSeconds} range=${rangeHeader ?? 'none'}`);
     } catch {}
-    return await handlePerfectReadGET(perfectReadParams, env as any, sidecarReader, rangeHeader);
+    // Optional init_len hint to skip duplicate head-read work in GET
+    const hintInitLenStr = url.searchParams.get("init_len");
+    const hintInitLen = hintInitLenStr ? parseInt(hintInitLenStr, 10) : undefined;
+    return await handlePerfectReadGET(perfectReadParams, env as any, sidecarReader, rangeHeader, hintInitLen);
   } else {
     return Response.json({ error: "Method not allowed" }, { status: 405 });
   }

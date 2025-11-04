@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,29 @@ app = FastAPI(title="Video Transcoder", version="1.0.0")
 
 # Thread pool for running synchronous transcoding operations
 executor = ThreadPoolExecutor(max_workers=10)
+
+# Global registry of active transcoders for signal handling
+_active_transcoders = set()
+_transcoders_lock = threading.Lock()
+
+
+def _signal_handler(signum, frame):
+    """Handle shutdown signals by killing all active transcoding processes."""
+    logger = logging.getLogger("video_transcoder")
+    sig_name = signal.Signals(signum).name
+    logger.warning(f"Received signal {sig_name} - killing all active transcoding processes")
+    
+    with _transcoders_lock:
+        transcoders_to_kill = list(_active_transcoders)
+    
+    for transcoder in transcoders_to_kill:
+        try:
+            transcoder.kill_processes()
+        except Exception as e:
+            logger.error(f"Error killing processes for transcoder {transcoder.request_id}: {e}")
+    
+    logger.info(f"Killed {len(transcoders_to_kill)} active transcoder(s)")
+    sys.exit(0)
 
 
 class TranscodeRequest(BaseModel):
@@ -76,6 +100,15 @@ class StreamingTranscoder:
         self._ytdlp_process = None
         self._ffmpeg_process = None
         self._process_lock = threading.Lock()
+        
+        # Register this transcoder globally for signal handling
+        with _transcoders_lock:
+            _active_transcoders.add(self)
+    
+    def _unregister(self):
+        """Unregister this transcoder from the global registry."""
+        with _transcoders_lock:
+            _active_transcoders.discard(self)
     
     def kill_processes(self):
         """Kill all active processes with SIGKILL (called when client disconnects)."""
@@ -667,6 +700,10 @@ class StreamingTranscoder:
                             pass
 
             return False, f"{type(e).__name__}: {str(e)}"
+        
+        finally:
+            # Unregister from global registry
+            self._unregister()
 
 
 @app.put("/transcode")
@@ -847,6 +884,11 @@ if __name__ == "__main__":
     
     configure_logging()
     logger = logging.getLogger("video_transcoder")
+    
+    # Set up signal handlers to kill active processes on shutdown
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    logger.info("Registered signal handlers for SIGTERM and SIGINT")
     
     port = int(os.environ.get('PORT', 8080))
     host = os.environ.get('HOST', '0.0.0.0')

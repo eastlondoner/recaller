@@ -76,13 +76,35 @@ async function r2Range(r2: R2B_SC & R2B_MP4, key: string, offset: number, length
   return await obj.arrayBuffer();
 }
 
+// Stream a byte range directly from R2 to a response controller without buffering
+async function streamR2Range(
+  r2: R2B_SC & R2B_MP4,
+  key: string,
+  offset: number,
+  length: number,
+  controller: ReadableStreamDefaultController<Uint8Array>
+) {
+  const obj = await r2.get(key, { range: { offset, length } });
+  if (!obj || !obj.body) throw new Error("R2 object not found");
+  const reader = (obj.body as ReadableStream<Uint8Array>).getReader();
+  // Drain the R2 stream and push chunks to the response stream
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (value && value.byteLength) controller.enqueue(value);
+  }
+}
+
 export async function handlePerfectReadHEAD(params: PerfectReadParams, env: Env, sidecarReader?: ISidecarReader) {
   const { bucket, key, fromSeconds, toSeconds } = params;
   const r2 = getBucket(env, bucket);
   const reader = sidecarReader ?? new JsonSidecarReader();
 
-  const { initLen } = await MP4InitReader.getInitLength(r2, key);
-  const plan = await reader.planWindow({ r2, key, fromSeconds, toSeconds, initLen } as any);
+  // Parallelize independent R2 reads for faster response
+  const [{ initLen }, plan] = await Promise.all([
+    MP4InitReader.getInitLength(r2, key),
+    reader.planWindow({ r2, key, fromSeconds, toSeconds, initLen: undefined } as any)
+  ]);
   const { initKey, fragKeys, metaKey } = buildCacheKeys(bucket, key, plan, initLen);
 
   // Pre-warm init cache (as 200)
@@ -130,12 +152,19 @@ export async function handlePerfectReadHEAD(params: PerfectReadParams, env: Env,
       "Content-Length": String(totalLength),
       "Accept-Ranges": "bytes",
       "X-Start-Frame-Index": String(plan.startFrameIndex),
+      "X-Init-Len": String(initLen),
       "Cache-Control": `public, max-age=${ONE_DAY}`,
     },
   });
 }
 
-export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, sidecarReader?: ISidecarReader, rangeHeader?: string | null) {
+export async function handlePerfectReadGET(
+  params: PerfectReadParams,
+  env: Env,
+  sidecarReader?: ISidecarReader,
+  rangeHeader?: string | null,
+  hintInitLen?: number
+) {
   const { bucket, key, fromSeconds, toSeconds } = params;
   const r2 = getBucket(env, bucket);
   const reader = sidecarReader ?? new JsonSidecarReader();
@@ -166,7 +195,10 @@ export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, 
   }
 
   // Try meta cache first; recompute if missing
-  const { initLen } = await MP4InitReader.getInitLength(r2, key);
+  // Use init_len hint if provided to avoid duplicate head-read
+  const initLen = (typeof hintInitLen === 'number' && Number.isFinite(hintInitLen) && hintInitLen > 0)
+    ? hintInitLen
+    : (await MP4InitReader.getInitLength(r2, key)).initLen;
   const tmpPlan = await reader.planWindow({ r2, key, fromSeconds, toSeconds, initLen } as any);
   const { initKey, fragKeys, metaKey } = buildCacheKeys(bucket, key, tmpPlan, initLen);
   let metaRes: Response | undefined;
@@ -197,57 +229,179 @@ export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, 
       fragments: fragMeta,
       totalLength: initLen + fragMeta.reduce((s, m) => s + m.length, 0),
     };
-    
+
     // Resolve suffix range now that we know total length
     if (isSuffixRange) {
       const suffixLength = rangeEnd;  // We stored the suffix length here
       rangeStart = Math.max(0, meta.totalLength - suffixLength);
       rangeEnd = meta.totalLength - 1;
     }
-    
-    // Buffer for Range request support (can't stream with Range)
-    const bufferParts: Uint8Array[] = [];
-    let bufferSize = 0;
-    
-    const initBuf = await r2Range(r2, key, 0, meta.init.length);
-    const initArr = new Uint8Array(initBuf);
-    bufferParts.push(initArr);
-    bufferSize += initArr.length;
-    
+
+    // Build part map for streaming
+    type PartInfo = { offset: number; length: number; r2Offset: number };
+    const partMap: PartInfo[] = [];
+    let currentOffset = 0;
+    // Init part
+    partMap.push({ offset: currentOffset, length: meta.init.length, r2Offset: 0 });
+    currentOffset += meta.init.length;
+    // Fragment parts
     for (let i = 0; i < fragMeta.length; i++) {
       const f = tmpPlan.fragments[tmpPlan.startFragmentIdx + i]!;
-      const buf = await r2Range(r2, key, f.moofOffset, f.moofSize + f.mdatSize);
-      const arr = new Uint8Array(buf);
-      bufferParts.push(arr);
-      bufferSize += arr.length;
+      const length = fragMeta[i]!.length;
+      partMap.push({ offset: currentOffset, length, r2Offset: f.moofOffset });
+      currentOffset += length;
     }
-    
-    // Combine all parts
-    const combined = new Uint8Array(bufferSize);
-    let writePos = 0;
-    for (const part of bufferParts) {
-      combined.set(part, writePos);
-      writePos += part.length;
-    }
-    
-    // Always return 206 for any Range request (even if range spans entire file)
+
+    // Determine needed local ranges per part
+    const neededParts: Array<{ part: PartInfo; localStart: number; localEnd: number }> = [];
     if (isRangeRequest) {
-      const actualRangeEnd = Math.min(rangeEnd, bufferSize - 1);
-      const rangedBuffer = combined.slice(rangeStart, actualRangeEnd + 1);
-      return new Response(rangedBuffer, {
+      for (const part of partMap) {
+        const partEnd = part.offset + part.length - 1;
+        if (rangeEnd >= part.offset && rangeStart <= partEnd) {
+          const localStart = Math.max(0, rangeStart - part.offset);
+          const localEnd = Math.min(part.length - 1, rangeEnd - part.offset);
+          neededParts.push({ part, localStart, localEnd });
+        }
+      }
+    } else {
+      for (const part of partMap) {
+        neededParts.push({ part, localStart: 0, localEnd: part.length - 1 });
+      }
+    }
+
+    // Build coalesced R2 ranges for fewer reads
+    type Range = { start: number; end: number };
+    const ranges: Range[] = neededParts.map(({ part, localStart, localEnd }) => {
+      const start = part.r2Offset + localStart;
+      const end = start + (localEnd - localStart + 1);
+      return { start, end };
+    }).sort((a, b) => a.start - b.start);
+
+    const merged: Range[] = [];
+    for (const r of ranges) {
+      const last = merged[merged.length - 1];
+      if (!last || r.start > last.end) {
+        merged.push({ start: r.start, end: r.end });
+      } else {
+        last.end = Math.max(last.end, r.end);
+      }
+    }
+
+    // If only a single contiguous range, use pass-through
+    if (merged.length === 1) {
+      const m = merged[0]!;
+      const len = m.end - m.start;
+      const obj = await r2.get(key, { range: { offset: m.start, length: len } });
+      if (!obj || !obj.body) throw new Error("R2 object not found");
+      if (isRangeRequest) {
+        const rangeType = isSuffixRange ? 'suffix' : 'normal';
+        console.log(`[PerfectRead] Streaming 206 Partial Content (${rangeType}): ${len} bytes (${rangeStart}-${rangeEnd}/${meta.totalLength})`);
+        return new Response(obj.body as ReadableStream<Uint8Array>, {
+          status: 206,
+          headers: {
+            "Content-Type": "video/mp4",
+            "Content-Length": String(len),
+            "Content-Range": `bytes ${rangeStart}-${rangeEnd}/${meta.totalLength}`,
+            "Accept-Ranges": "bytes",
+            "X-Start-Frame-Index": String(meta.startFrameIndex),
+            "Cache-Control": "no-cache",
+          },
+        });
+      }
+      return new Response(obj.body as ReadableStream<Uint8Array>, {
+        status: 200,
+        headers: cacheHeaders({
+          "Content-Type": "video/mp4",
+          "Content-Length": String(meta.totalLength),
+          "Accept-Ranges": "bytes",
+          "X-Start-Frame-Index": String(meta.startFrameIndex),
+        }),
+      });
+    }
+
+    // Otherwise stream with lookahead prefetch and start init ASAP if included
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          // Helper to read a body to the controller
+          const pump = async (reader: ReadableStreamDefaultReader<Uint8Array>) => {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength) controller.enqueue(value);
+            }
+          };
+
+          // Stream each merged range with 1-ahead prefetch
+          let nextReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+          for (let i = 0; i < merged.length; i++) {
+            const { start, end } = merged[i]!;
+            const length = end - start;
+
+            // Open current range (use prefetched if available)
+            let curReader: ReadableStreamDefaultReader<Uint8Array>;
+            if (nextReader) {
+              curReader = nextReader;
+              nextReader = null;
+            } else {
+              const obj = await r2.get(key, { range: { offset: start, length } });
+              if (!obj || !obj.body) throw new Error("R2 object not found");
+              curReader = (obj.body as ReadableStream<Uint8Array>).getReader();
+            }
+
+            // Prefetch next range if any
+            let prefetchPromise: Promise<ReadableStreamDefaultReader<Uint8Array>> | null = null;
+            if (i + 1 < merged.length) {
+              const next = merged[i + 1]!;
+              const nextLen = next.end - next.start;
+              prefetchPromise = (async () => {
+                const nextObj = await r2.get(key, { range: { offset: next.start, length: nextLen } });
+                if (!nextObj || !nextObj.body) throw new Error("R2 object not found");
+                return (nextObj.body as ReadableStream<Uint8Array>).getReader();
+              })();
+            }
+
+            await pump(curReader);
+            if (prefetchPromise) {
+              try { nextReader = await prefetchPromise; } catch {}
+            }
+          }
+
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    const totalBytesToSend = neededParts.reduce((sum, { localStart, localEnd }) => sum + (localEnd - localStart + 1), 0);
+
+    if (isRangeRequest) {
+      const rangeType = isSuffixRange ? 'suffix' : 'normal';
+      // Single summary log for partial content
+      console.log(`[PerfectRead] 206 (${rangeType}): ${totalBytesToSend} bytes (${rangeStart}-${rangeEnd}/${meta.totalLength})`);
+      return new Response(stream, {
         status: 206,
         headers: {
           "Content-Type": "video/mp4",
-          "Content-Length": String(rangedBuffer.length),
-          "Content-Range": `bytes ${rangeStart}-${actualRangeEnd}/${bufferSize}`,
+          "Content-Length": String(totalBytesToSend),
+          "Content-Range": `bytes ${rangeStart}-${rangeEnd}/${meta.totalLength}`,
           "Accept-Ranges": "bytes",
           "X-Start-Frame-Index": String(meta.startFrameIndex),
-          "Cache-Control": "no-cache",  // Don't cache partial responses
+          "Cache-Control": "no-cache",
         },
       });
     }
-    
-    return new Response(combined, { status: 200, headers: cacheHeaders({ "Content-Type": "video/mp4", "Content-Length": String(bufferSize), "Accept-Ranges": "bytes", "X-Start-Frame-Index": String(meta.startFrameIndex) }) });
+
+    return new Response(stream, {
+      status: 200,
+      headers: cacheHeaders({
+        "Content-Type": "video/mp4",
+        "Content-Length": String(meta.totalLength),
+        "Accept-Ranges": "bytes",
+        "X-Start-Frame-Index": String(meta.startFrameIndex),
+      }),
+    });
   }
   const meta = await metaRes.json() as { startFrameIndex: number; init: { key: string; length: number }; fragments: Array<{ key: string; length: number }>; totalLength: number };
 
@@ -310,8 +464,8 @@ export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, 
     }
   }
 
-  // Stream the response
-  const stream = new ReadableStream({
+  // Stream the response (cache-aware per-part; trimmed logs)
+  const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         for (const { part, localStart, localEnd } of neededParts) {
@@ -320,21 +474,30 @@ export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, 
           // Try cache first
           let cached: Response | undefined;
           try {
-            // Request the specific range from cache
             const cacheReq = new Request(part.cacheKey, {
               headers: { Range: `bytes=${localStart}-${localEnd}` }
             });
             cached = await caches.default.match(cacheReq);
           } catch {}
           
-          if (cached) {
-            const chunk = new Uint8Array(await cached.arrayBuffer());
-            controller.enqueue(chunk);
+          if (cached && cached.body) {
+            const reader = (cached.body as ReadableStream<Uint8Array>).getReader();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength) controller.enqueue(value);
+            }
           } else {
             // Fallback to R2 with the specific byte range needed
             const r2Offset = part.r2Offset + localStart;
-            const buf = await r2Range(r2, key, r2Offset, neededLength);
-            controller.enqueue(new Uint8Array(buf));
+            const obj = await r2.get(key, { range: { offset: r2Offset, length: neededLength } });
+            if (!obj || !obj.body) throw new Error("R2 object not found");
+            const reader = (obj.body as ReadableStream<Uint8Array>).getReader();
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength) controller.enqueue(value);
+            }
           }
         }
         controller.close();
@@ -352,7 +515,7 @@ export async function handlePerfectReadGET(params: PerfectReadParams, env: Env, 
   // Handle Range request
   if (isRangeRequest) {
     const rangeType = isSuffixRange ? 'suffix' : 'normal';
-    console.log(`[PerfectRead] Streaming 206 Partial Content (${rangeType}): ${totalBytesToSend} bytes (${rangeStart}-${rangeEnd}/${totalLen})`);
+    console.log(`[PerfectRead] 206 (${rangeType}): ${totalBytesToSend} bytes (${rangeStart}-${rangeEnd}/${totalLen})`);
     return new Response(stream, {
       status: 206,
       headers: {

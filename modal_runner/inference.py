@@ -154,6 +154,8 @@ def run_inference_hevc_fragmented_with_proxy():
     video_urls = [
         "https://pub-49087f9aed1d4d0598933452c9dece5a.r2.dev/transcoded/1762125489561_test_1min_h264_mp4_fragmented.mp4",
         "https://pub-49087f9aed1d4d0598933452c9dece5a.r2.dev/transcoded/1762192262450_T5QKShZxPH4_fragmented.mp4",
+        "https://pub-49087f9aed1d4d0598933452c9dece5a.r2.dev/transcoded/1762216082652_xlrj36cAzj4_fragmented.mp4",
+        "https://pub-49087f9aed1d4d0598933452c9dece5a.r2.dev/transcoded/1762256948745_hjaxUZ4xrSY_fragmented.mp4",
     ]
     
     print("\n" + "="*80)
@@ -163,13 +165,24 @@ def run_inference_hevc_fragmented_with_proxy():
         print(f"VIDEO {idx}: {url}")
     
     # Use seeded random to select frames from first 10 seconds (reproducible)
-    # Process 3 batches, each with different random timestamps
+    # Process 30 batches, each with 4 frames per video at 0.2s stride
+    # Enable local segment downloads to test local file decoding performance
+    # Concurrency: 16 HEAD workers, 16 download workers (tuned for bandwidth)
+    # Minimum inference time: 1.1s per batch (for workload simulation)
+    print("[CONFIG] local-decode-mode: true")
+    print("[CONFIG] minimum-inference-time: 1.1s")
     result = run_inference_impl(
         video_urls=video_urls,
         random_seed=42,
         offset_max_seconds=10.0,
-        num_batches=10,
+        num_batches=30,
         return_frame_png=True,
+        frames_per_sample=4,
+        frame_stride_seconds=0.2,
+        prefer_local_segments=True,
+        head_workers=16,
+        download_workers=16,
+        minimum_inference_time_seconds=1.1,
     )
     
     # Commit changes to volume so cache persists across runs
